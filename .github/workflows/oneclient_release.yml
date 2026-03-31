@@ -1,0 +1,127 @@
+name: OneClient Release Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest # ARM
+            args: --target aarch64-apple-darwin
+          - platform: macos-latest # Intel
+            args: --target x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            args: ''
+          - platform: windows-latest
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./apps/oneclient/desktop/package.json').version")
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
+          target: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          save-cache: true
+          restore-cache: true
+
+      - name: Add x86_64-apple-darwin target
+        if: contains(matrix.args, 'x86_64-apple-darwin')
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Setup Packages
+        uses: ./.github/actions/setup-packages
+
+      - name: import Apple Developer Certificate
+        if: startsWith(matrix.platform, 'macos')
+        # Prevents keychain from locking automatically for 3600 seconds.
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: verify certificate
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          IDENTITIES=$(security find-identity -v -p codesigning build.keychain || true)
+          echo "$IDENTITIES"
+
+          CERT_ID=$(echo "$IDENTITIES" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$CERT_ID" ]; then
+            CERT_ID=$(echo "$IDENTITIES" | awk -F'"' '/^[[:space:]]*[0-9]+\)/ && $2 != "" {print $2; exit}')
+            if [ -n "$CERT_ID" ]; then
+              echo "::warning::Developer ID Application certificate not found. Falling back to: $CERT_ID"
+            fi
+          fi
+
+          if [ -z "$CERT_ID" ]; then
+            echo "::error::No code-signing certificate was found in build.keychain. Check APPLE_CERTIFICATE/APPLE_CERTIFICATE_PASSWORD and ensure the cert includes a private key."
+            exit 1
+          fi
+
+          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
+          echo "Certificate imported."
+
+      - name: Build App (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        uses: tauri-apps/tauri-action@dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+        with:
+          tagName: oneclient-${{ env.RELEASE_VERSION }}
+          releaseName: OneClient ${{ env.RELEASE_VERSION }}
+          releaseDraft: true
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-alpha') || false }}
+          retryAttempts: 3
+          tauriScript: pnpm -w oneclient:desktop
+          args: ${{ matrix.args }}
+          projectPath: ./apps/oneclient/desktop/
+          uploadUpdaterJson: true
+
+      - name: Build App (non-macOS)
+        if: startsWith(matrix.platform, 'macos') == false
+        uses: tauri-apps/tauri-action@dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: oneclient-${{ env.RELEASE_VERSION }}
+          releaseName: OneClient ${{ env.RELEASE_VERSION }}
+          releaseDraft: true
+          prerelease: ${{ startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-alpha') || false }}
+          retryAttempts: 3
+          tauriScript: pnpm -w oneclient:desktop
+          args: ${{ matrix.args }}
+          projectPath: ./apps/oneclient/desktop/
+          uploadUpdaterJson: true
